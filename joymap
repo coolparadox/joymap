@@ -1,0 +1,156 @@
+#!/bin/sh
+
+# Copyright 2016 Rafael Lorandi <coolparadox@gmail.com>
+# This file is part of joymap, a framework for game controller
+# button remapping for games built around jscal utility from
+# Linux Console Project <http://sourceforge.net/projects/linuxconsole/>.
+# 
+# Joymap is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# Joymap is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with Concur. If not, see <http://www.gnu.org/licenses/>.
+
+set -e
+
+ME=$( basename $0 )
+CFG_DIR=$( dirname $0 )
+
+usage() {
+	echo "usage: ${ME} <game>" 1>&2
+	exit 1
+}
+
+GAME="$1"
+test -n "$GAME" || usage
+shift
+test $# -eq 0 || usage
+
+fail() {
+	echo "${ME}: error: $*" 1>&2
+	exit 1
+}
+
+find_controller_def() {
+	MATCH_VENDOR=$1
+	MATCH_PRODUCT=$2
+	find $CFG_DIR/controllers -mindepth 1 -maxdepth 1 -type d | \
+	while read DIR ; do
+		CONTROLLER=$( basename $DIR )
+		STATE_FILE=$CFG_DIR/controllers/$CONTROLLER/jscal.state
+		local VENDOR=''
+		local PRODUCT=''
+		eval $( grep -e '^VENDOR=' -e '^PRODUCT=' $STATE_FILE )
+		test "$MATCH_VENDOR" = "$VENDOR" || continue
+		test "$MATCH_PRODUCT" = "$PRODUCT" || continue
+		echo $CONTROLLER
+		break
+	done
+}
+
+for JS in /dev/input/js* ; do
+
+	eval $( udevadm info -a -n $JS | /usr/share/joystick/ident )
+	echo "$JS $VENDOR:$PRODUCT $NAME" 1>&2
+	CONTROLLER=$( find_controller_def $VENDOR $PRODUCT )
+	test -n "$CONTROLLER" || {
+		echo "jscal.state not found for '$VENDOR':'$PRODUCT', skipping" 1>&2
+		continue
+	}
+	echo "matched definition for controller: $CONTROLLER" 1>&2
+
+	BUTTONS_FILE="$CFG_DIR/controllers/$CONTROLLER/buttons"
+	test -r "$BUTTONS_FILE" || fail "missing file: $BUTTONS_FILE"
+
+	IDX=0
+	declare -a BUTTON_NAMES
+	declare -A NAME_INDEXES
+	while read NAME ; do
+		BUTTON_NAMES[IDX]=$NAME
+		NAME_INDEXES[$NAME]=$IDX
+		IDX=$((IDX+1))
+	done 0<$BUTTONS_FILE
+	#echo "button mapping for $CONTROLLER: ${BUTTON_NAMES[*]}" 1>&2
+	#echo ${NAME_INDEXES[*]}
+
+	STATE_FILE="$CFG_DIR/controllers/$CONTROLLER/jscal.state"
+	test -r "$STATE_FILE" || fail "missing file: $STATE_FILE"
+
+	TEMP_FILE=$( mktemp )
+	sed -r \
+		-e '/^jscal -u +/!d' \
+		-e 's/^jscal -u *//' \
+		-e 's/,/\n/g' \
+		$STATE_FILE 1>$TEMP_FILE
+	IDX=0
+	declare -a AXIS_CODES
+	declare -a BUTTON_CODES
+	AXIS=1
+	SIZE=0
+	while read CODE ; do
+		if test $AXIS -ne 0 ; then
+			if test $SIZE -eq 0 ; then
+				SIZE=$CODE
+				IDX=0
+			else
+				if test $IDX -ge $SIZE ; then
+					AXIS=0
+					IDX=0
+				else
+					AXIS_CODES[IDX]=$CODE
+					IDX=$((IDX+1))
+				fi
+			fi
+		else
+			BUTTON_CODES[IDX]=$CODE
+			IDX=$((IDX+1))
+		fi
+	done 0<$TEMP_FILE
+	rm -f $TEMP_FILE
+	#echo "axis codes for $CONTROLLER: ${AXIS_CODES[*]}" 1>&2
+
+	#echo -n "button codes for $CONTROLLER:" 1>&2
+	#for NAME in ${BUTTON_NAMES[*]} ; do
+		#IDX=${NAME_INDEXES[$NAME]}
+		#CODE=${BUTTON_CODES[IDX]}
+		#echo -n " $CODE($NAME)" 1>&2
+	#done
+	#echo 1>&2
+
+	REMAP_FILE="$CFG_DIR/games/$GAME/${CONTROLLER}.buttons"
+	test -r "$REMAP_FILE" || fail "missing file: $REMAP_FILE"
+	declare -a REMAP_CODES
+	REMAP_IDX=0
+	while read NAME ; do
+		IDX=${NAME_INDEXES[$NAME]}
+		CODE=${BUTTON_CODES[IDX]}
+		REMAP_CODES[REMAP_IDX]=$CODE
+		REMAP_IDX=$((REMAP_IDX+1))
+	done 0<$REMAP_FILE
+	while test $REMAP_IDX -lt ${#BUTTON_CODES[*]} ; do
+		REMAP_CODES[REMAP_IDX]=${BUTTON_CODES[REMAP_IDX]}
+		REMAP_IDX=$((REMAP_IDX+1))
+	done
+
+	echo "applying $GAME button remap for $CONTROLLER..." 1>&2
+	COMMAND=$(
+		IFS=','
+		echo -n 'jscal -u'
+		echo -n " ${#AXIS_CODES[*]},"
+		echo -n "${AXIS_CODES[*]}"
+		echo -n ",${#REMAP_CODES[*]},"
+		echo -n "${REMAP_CODES[*]}"
+		echo " $JS"
+	)
+	echo $COMMAND
+	$COMMAND
+
+done
+
