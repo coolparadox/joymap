@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # Copyright 2016 Rafael Lorandi <coolparadox@gmail.com>
 # This file is part of joymap, a framework for game controller
@@ -24,19 +24,99 @@ ME=$( basename $0 )
 CFG_DIR=$( dirname $0 )
 
 usage() {
-	echo "usage: ${ME} <game>" 1>&2
+	echo "usage: ${ME} [--scriptable] [--devices=/dev/input/jsN[,...]] [<game>]" 1>&2
 	exit 1
 }
 
-GAME="$1"
-test -n "$GAME" || usage
-shift
+SCRIPTABLE=0
+declare -a DEVICES
+while test $# -gt 0 ; do
+	OPT="$1"
+	case "$OPT" in
+		--scriptable) SCRIPTABLE=1 ;;
+		--devices=*)
+			AUX=${OPT#*=}
+			AUX=${AUX//,/ }
+			DEVICES=( $AUX )
+			;;
+		-*) usage ;;
+		*) break ;;
+	esac
+	shift
+done
+GAME=""
+test $# -le 0 || {
+	GAME="$1"
+	shift
+}
 test $# -eq 0 || usage
 
+message() {
+	TYPE=$1
+	shift
+	if test $SCRIPTABLE -eq 0 ; then
+		Xdialog --title "${ME} ${TYPE}" --msgbox "$*" 0 0 || true
+	else
+		echo "${ME} ${TYPE}:" "$*" 1>&2
+	fi
+}
+
+info() {
+	message info $*
+}
+
+warning() {
+	message warning $*
+}
+
 fail() {
-	echo "${ME}: error: $*" 1>&2
+	message error $*
 	exit 1
 }
+
+log_error_file() {
+	LOG_FILE=$1
+	shift
+	if test $SCRIPTABLE -eq 0 ; then
+		MSG_FILE=$( mktemp )
+		echo "$*, log follows:" 1>>$MSG_FILE
+		echo 1>>$MSG_FILE
+		cat $LOG_FILE 1>>$MSG_FILE
+		Xdialog --title "${ME} error" --no-cancel --textbox $MSG_FILE 20 80 || true
+		rm -f $MSG_FILE
+	else
+		echo "${ME} error:" "$*, log follows:" 1>&2
+		cat $LOG_FILE 1>&2
+	fi
+}
+
+game_select_gui() {
+	GAMES_FILE=$( mktemp )
+	find $CFG_DIR/games -mindepth 1 -maxdepth 1 -type d -exec basename '{}' ';' 1>$GAMES_FILE
+	local -a GAMES
+	local IDX=0
+	while read GAME ; do
+		GAMES[IDX]=$GAME
+		IDX=$((IDX+1))
+		GAMES[IDX]=$GAME
+		IDX=$((IDX+1))
+	done 0<$GAMES_FILE
+	rm -f $GAMES_FILE
+	Xdialog \
+		--title "${ME} game selection" \
+		--no-tags \
+		--menu "Please select a map configuration:" \
+		0 0 10 \
+		${GAMES[*]} \
+		2>&1
+}
+
+if test $SCRIPTABLE -eq 0 ; then
+	test -n "$GAME" || GAME=$( game_select_gui ) || true
+	test -n "$GAME" || exit 0
+else
+	test -n "$GAME" || fail "game parameter is required in scriptable mode"
+fi
 
 find_controller_def() {
 	MATCH_VENDOR=$1
@@ -55,16 +135,26 @@ find_controller_def() {
 	done
 }
 
-for JS in /dev/input/js* ; do
+test -n "$DEVICES" || {
+	DEVICES=( /dev/input/js* )
+}
+test "${DEVICES[0]}" != '/dev/input/js*' || DEVICES=()
+test ${#DEVICES[*]} -gt 0 || fail "no joysticks found in /dev/input/js*"
 
+for JS in ${DEVICES[*]} ; do
+
+	VENDOR=''
+	PRODUCT=''
+	NAME=''
 	eval $( udevadm info -a -n $JS | /usr/share/joystick/ident )
-	echo "$JS $VENDOR:$PRODUCT $NAME" 1>&2
+	test -n "$VENDOR" -a -n "$PRODUCT" || continue
+	info "Found $JS $VENDOR:$PRODUCT $NAME"
 	CONTROLLER=$( find_controller_def $VENDOR $PRODUCT )
 	test -n "$CONTROLLER" || {
-		echo "jscal.state not found for '$VENDOR':'$PRODUCT', skipping" 1>&2
+		warning "jscal.state not found for '$VENDOR':'$PRODUCT', skipping"
 		continue
 	}
-	echo "matched definition for controller: $CONTROLLER" 1>&2
+	#info "$VENDOR:$PRODUCT matches definition for controller: $CONTROLLER"
 
 	BUTTONS_FILE="$CFG_DIR/controllers/$CONTROLLER/buttons"
 	test -r "$BUTTONS_FILE" || fail "missing file: $BUTTONS_FILE"
@@ -139,7 +229,7 @@ for JS in /dev/input/js* ; do
 		REMAP_IDX=$((REMAP_IDX+1))
 	done
 
-	echo "applying $GAME button remap for $CONTROLLER..." 1>&2
+	#info "applying $GAME button remap for $CONTROLLER..."
 	COMMAND=$(
 		IFS=','
 		echo -n 'jscal -u'
@@ -149,8 +239,14 @@ for JS in /dev/input/js* ; do
 		echo -n "${REMAP_CODES[*]}"
 		echo " $JS"
 	)
-	echo $COMMAND
-	$COMMAND
+	LOG_FILE=$( mktemp )
+	echo $COMMAND 1>>$LOG_FILE
+	if $COMMAND 1>>$LOG_FILE 2>&1 ; then
+		info "$GAME remapping successfully applied to $CONTROLLER controller $JS"
+	else
+		log_error_file $LOG_FILE "$GAME remapping failed to $CONTROLLER controller $JS"
+	fi
+	rm -f $LOG_FILE
 
 done
 
